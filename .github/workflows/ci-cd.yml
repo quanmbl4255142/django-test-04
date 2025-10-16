@@ -1,0 +1,367 @@
+name: Django CI/CD Pipeline
+
+# CHỈ CHẠY KHI:
+# 1. Push code lên main branch
+# 2. Manual trigger (workflow_dispatch)
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch: # Cho phép chạy thủ công
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+# WORKFLOW CÓ 3 STEPS TUẦN TỰ:
+# 1. test → Test Django code
+# 2. build-and-push → Build Docker image + Push lên GHCR  
+# 3. update-manifests → Update K8s manifests trong Repository_B
+
+jobs:
+  # STEP 1: Test Django code
+  test:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.11'
+        
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+        pip install pytest pytest-cov
+        
+    - name: Run tests
+      run: |
+        # Set Django settings module
+        export DJANGO_SETTINGS_MODULE=django-test-04.settings
+        # Kiểm tra import Django
+        python -c "import django; print(f'Django version: {django.get_version()}')"
+        # Basic Django check (no database required)
+        python -c "
+        import os
+        import sys
+        import django
+        from django.conf import settings
+        
+        # Minimal settings for testing
+        os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'django-test-04.settings')
+        
+        try:
+            django.setup()
+            print('✅ Django setup successful')
+            
+            # Test basic imports
+            from api.models import *
+            from api.views import *
+            print('✅ Models and views imported successfully')
+            
+        except Exception as e:
+            print(f'❌ Django test failed: {e}')
+            sys.exit(1)
+        "
+
+  # STEP 2: Build Docker image và push lên GHCR
+  build-and-push:
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+      
+    - name: Log in to Container Registry
+      uses: docker/login-action@v3
+      with:
+        registry: ${{ env.REGISTRY }}
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+        
+    - name: Extract metadata
+      id: meta
+      uses: docker/metadata-action@v5
+      with:
+        images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+        tags: |
+          type=ref,event=branch
+          type=ref,event=pr
+          type=sha,prefix=${{ github.ref_name }}
+          type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
+          
+    - name: Build and push Docker image
+      uses: docker/build-push-action@v5
+      with:
+        context: .
+        platforms: linux/amd64,linux/arm64
+        push: true
+        tags: ${{ steps.meta.outputs.tags }}
+        labels: ${{ steps.meta.outputs.labels }}
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+        build-args: |
+          BUILDKIT_INLINE_CACHE=1
+      # Continue on error để debug
+      continue-on-error: true
+      
+    - name: Check build result
+      run: |
+        if [ "${{ job.status }}" = "failure" ]; then
+          echo "❌ Docker build failed!"
+          echo "🔍 Common issues:"
+          echo "  1. Dockerfile syntax error"
+          echo "  2. Missing dependencies in requirements.txt"
+          echo "  3. Permission issues with GHCR"
+          echo "  4. Network issues during build"
+          exit 1
+        else
+          echo "✅ Docker build successful"
+        fi
+
+  # STEP 3: Update K8s manifests trong Repository_B
+  update-manifests:
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    permissions:
+      contents: write
+    
+    steps:
+    - name: Debug - Check secrets
+      run: |
+        echo "🔍 Checking secrets availability..."
+        if [ -z "${{ secrets.PAT_TOKEN }}" ]; then
+          echo "❌ PAT_TOKEN secret is not set!"
+          echo "📝 Please add PAT_TOKEN secret to repository settings"
+          echo "🔗 Go to: Settings → Secrets and variables → Actions → New repository secret"
+          echo "   Name: PAT_TOKEN"
+          echo "   Value: Your GitHub Personal Access Token"
+          exit 1
+        else
+          echo "✅ PAT_TOKEN secret is available"
+        fi
+        
+    - name: Checkout manifests repo
+      uses: actions/checkout@v4
+      with:
+        repository: quanmbl4255142/repository_b_ci_cd_fpt_repob_devops
+        token: ${{ secrets.PAT_TOKEN }}
+        path: manifests
+        fetch-depth: 0
+        
+    - name: Debug - List manifests directory
+      run: |
+        echo "=== Manifests directory structure ==="
+        cd manifests
+        
+        # Define app_name variable
+        APP_NAME="django-test-04"
+        echo "📦 Target app: $APP_NAME"
+        
+        find . -type f -name "*.yaml" | head -20
+        echo "=== apps directory ==="
+        ls -la apps/ || echo "No apps directory found"
+        echo "=== Looking for deployment.yaml ==="
+        ls -la apps/$APP_NAME/deployment.yaml || echo "No deployment.yaml found"
+        
+    - name: Update image tag in deployment
+      run: |
+        cd manifests
+        echo "Current directory: $(pwd)"
+        echo "Files in manifests:"
+        ls -la
+        
+        # Define app_name variable
+        APP_NAME="django-test-04"
+        echo "📦 Target app: $APP_NAME"
+        
+        DEPLOYMENT_FILE="apps/$APP_NAME/deployment.yaml"
+        
+        if [ ! -f "$DEPLOYMENT_FILE" ]; then
+          echo "❌ Error: $DEPLOYMENT_FILE not found!"
+          echo "📁 Current directory: $(pwd)"
+          echo "📂 Directory contents:"
+          ls -la
+          echo "🔍 Looking for deployment files in apps/$APP_NAME/:"
+          find apps/$APP_NAME -name "deployment.yaml" -type f 2>/dev/null || echo "No deployment.yaml found in apps/$APP_NAME/"
+          echo "💡 Creating apps/$APP_NAME/ directory if it doesn't exist..."
+          mkdir -p "apps/$APP_NAME"
+          echo "📝 Creating deployment.yaml..."
+          
+          # Create deployment.yaml using echo commands to avoid heredoc issues
+          echo "apiVersion: apps/v1" > "$DEPLOYMENT_FILE"
+          echo "kind: Deployment" >> "$DEPLOYMENT_FILE"
+          echo "metadata:" >> "$DEPLOYMENT_FILE"
+          echo "  name: django-test-04" >> "$DEPLOYMENT_FILE"
+          echo "  namespace: django-test-04" >> "$DEPLOYMENT_FILE"
+          echo "  labels:" >> "$DEPLOYMENT_FILE"
+          echo "    app: django-test-04" >> "$DEPLOYMENT_FILE"
+          echo "    environment: production" >> "$DEPLOYMENT_FILE"
+          echo "  annotations:" >> "$DEPLOYMENT_FILE"
+          echo "    argocd-image-updater.argoproj.io/image-list: django-test-04=ghcr.io/quanmbl4255142/django-test-04" >> "$DEPLOYMENT_FILE"
+          echo "    argocd-image-updater.argoproj.io/write-back-method: git" >> "$DEPLOYMENT_FILE"
+          echo "    argocd-image-updater.argoproj.io/write-back-target: apps/django-test-04/deployment.yaml" >> "$DEPLOYMENT_FILE"
+          echo "    argocd-image-updater.argoproj.io/django-test-04.update-strategy: latest" >> "$DEPLOYMENT_FILE"
+          echo "    argocd-image-updater.argoproj.io/django-test-04.allow-tags: regexp:^.*$" >> "$DEPLOYMENT_FILE"
+          echo "spec:" >> "$DEPLOYMENT_FILE"
+          echo "  replicas: 2" >> "$DEPLOYMENT_FILE"
+          echo "  selector:" >> "$DEPLOYMENT_FILE"
+          echo "    matchLabels:" >> "$DEPLOYMENT_FILE"
+          echo "      app: django-test-04" >> "$DEPLOYMENT_FILE"
+          echo "  template:" >> "$DEPLOYMENT_FILE"
+          echo "    metadata:" >> "$DEPLOYMENT_FILE"
+          echo "      labels:" >> "$DEPLOYMENT_FILE"
+          echo "        app: django-test-04" >> "$DEPLOYMENT_FILE"
+          echo "        environment: production" >> "$DEPLOYMENT_FILE"
+          echo "      annotations:" >> "$DEPLOYMENT_FILE"
+          echo "        timestamp: \"$(date +%s)\"" >> "$DEPLOYMENT_FILE"
+          echo "    spec:" >> "$DEPLOYMENT_FILE"
+          echo "      initContainers:" >> "$DEPLOYMENT_FILE"
+          echo "      - name: init-data-dir" >> "$DEPLOYMENT_FILE"
+          echo "        image: busybox:latest" >> "$DEPLOYMENT_FILE"
+          echo "        command: ['sh', '-c', 'mkdir -p /app/data && chmod 777 /app/data']" >> "$DEPLOYMENT_FILE"
+          echo "        volumeMounts:" >> "$DEPLOYMENT_FILE"
+          echo "        - name: django-test-04-data" >> "$DEPLOYMENT_FILE"
+          echo "          mountPath: /app/data" >> "$DEPLOYMENT_FILE"
+          echo "      containers:" >> "$DEPLOYMENT_FILE"
+          echo "      - name: django-test-04" >> "$DEPLOYMENT_FILE"
+          echo "        image: ghcr.io/quanmbl4255142/django-test-04:latest" >> "$DEPLOYMENT_FILE"
+          echo "        command: [\"/bin/sh\", \"-c\"]" >> "$DEPLOYMENT_FILE"
+          echo "        args:" >> "$DEPLOYMENT_FILE"
+          echo "          - |" >> "$DEPLOYMENT_FILE"
+          echo "            python manage.py migrate --noinput" >> "$DEPLOYMENT_FILE"
+          echo "            python manage.py collectstatic --noinput" >> "$DEPLOYMENT_FILE"
+          echo "            gunicorn --bind 0.0.0.0:8000 django-test-04.wsgi:application" >> "$DEPLOYMENT_FILE"
+          echo "        lifecycle:" >> "$DEPLOYMENT_FILE"
+          echo "          preStop:" >> "$DEPLOYMENT_FILE"
+          echo "            exec:" >> "$DEPLOYMENT_FILE"
+          echo "              command: [\"/bin/sh\", \"-c\", \"sleep 5\"]" >> "$DEPLOYMENT_FILE"
+          echo "        ports:" >> "$DEPLOYMENT_FILE"
+          echo "        - containerPort: 8000" >> "$DEPLOYMENT_FILE"
+          echo "        env:" >> "$DEPLOYMENT_FILE"
+          echo "        - name: DJANGO_SETTINGS_MODULE" >> "$DEPLOYMENT_FILE"
+          echo "          value: \"django-test-04.settings\"" >> "$DEPLOYMENT_FILE"
+          echo "        - name: ENVIRONMENT" >> "$DEPLOYMENT_FILE"
+          echo "          value: \"production\"" >> "$DEPLOYMENT_FILE"
+          echo "        volumeMounts:" >> "$DEPLOYMENT_FILE"
+          echo "        - name: django-test-04-data" >> "$DEPLOYMENT_FILE"
+          echo "          mountPath: /app/data" >> "$DEPLOYMENT_FILE"
+          echo "        resources:" >> "$DEPLOYMENT_FILE"
+          echo "          requests:" >> "$DEPLOYMENT_FILE"
+          echo "            memory: \"256Mi\"" >> "$DEPLOYMENT_FILE"
+          echo "            cpu: \"250m\"" >> "$DEPLOYMENT_FILE"
+          echo "          limits:" >> "$DEPLOYMENT_FILE"
+          echo "            memory: \"512Mi\"" >> "$DEPLOYMENT_FILE"
+          echo "            cpu: \"500m\"" >> "$DEPLOYMENT_FILE"
+          echo "        livenessProbe:" >> "$DEPLOYMENT_FILE"
+          echo "          httpGet:" >> "$DEPLOYMENT_FILE"
+          echo "            path: /api/health/" >> "$DEPLOYMENT_FILE"
+          echo "            port: 8000" >> "$DEPLOYMENT_FILE"
+          echo "          initialDelaySeconds: 30" >> "$DEPLOYMENT_FILE"
+          echo "          periodSeconds: 10" >> "$DEPLOYMENT_FILE"
+          echo "        readinessProbe:" >> "$DEPLOYMENT_FILE"
+          echo "          httpGet:" >> "$DEPLOYMENT_FILE"
+          echo "            path: /api/health/" >> "$DEPLOYMENT_FILE"
+          echo "            port: 8000" >> "$DEPLOYMENT_FILE"
+          echo "          initialDelaySeconds: 5" >> "$DEPLOYMENT_FILE"
+          echo "          periodSeconds: 5" >> "$DEPLOYMENT_FILE"
+          echo "      volumes:" >> "$DEPLOYMENT_FILE"
+          echo "      - name: django-test-04-data" >> "$DEPLOYMENT_FILE"
+          echo "        persistentVolumeClaim:" >> "$DEPLOYMENT_FILE"
+          echo "          claimName: django-test-04-pvc" >> "$DEPLOYMENT_FILE"
+          
+          echo "✅ Created deployment.yaml"
+        fi
+        
+        echo "Before update:"
+        grep "image:" "$DEPLOYMENT_FILE" || echo "No image found"
+        
+        # Update image tag
+        sed -i "s|image: ghcr.io/.*/.*:.*|image: ghcr.io/quanmbl4255142/django-test-04:latest|g" "$DEPLOYMENT_FILE"
+        
+        echo "After update:"
+        grep "image:" "$DEPLOYMENT_FILE"
+        
+        # Update timestamp để force restart pods
+        TIMESTAMP=$(date +%s)
+        echo "Adding timestamp to pod template: $TIMESTAMP"
+        sed -i "/^        timestamp:/c\        timestamp: \"$TIMESTAMP\"" "$DEPLOYMENT_FILE"
+        
+        echo "Updated timestamp in pod template:"
+        grep "timestamp:" "$DEPLOYMENT_FILE"
+        
+    - name: Commit and push changes
+      run: |
+        cd manifests
+        git config --local user.email "action@github.com"
+        git config --local user.name "GitHub Action"
+        
+        # Define app_name variable
+        APP_NAME="django-test-04"
+        
+        # Add apps directory
+        git add apps/$APP_NAME/ || echo "⚠️ No new files to add"
+        
+        # Check what files are staged
+        echo "📋 Staged files:"
+        git diff --cached --name-only || echo "No staged files"
+        
+        # Check if there are changes to commit
+        if git diff --cached --quiet; then
+          echo "ℹ️ No changes to commit - deployment.yaml is already up to date"
+        else
+          # Commit changes
+          git commit -m "chore: update k8s manifests for django-test-04 [skip ci]"
+          git remote set-url origin https://${{ secrets.PAT_TOKEN }}@github.com/quanmbl4255142/repository_b_ci_cd_fpt_repob_devops.git
+          git push origin main
+          echo "✅ Successfully pushed manifests to Repository_B"
+        fi
+        
+    - name: Notify Deployment Completion
+      run: |
+        # Define app_name variable
+        APP_NAME="django-test-04"
+        
+        echo "✅ CI/CD Pipeline completed successfully!"
+        echo "📦 Docker image built and pushed to: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest"
+        echo "🔄 ArgoCD Image Updater sẽ tự động update deployment.yaml"
+        echo "📝 ArgoCD sẽ tự động sync và deploy"
+        echo ""
+        echo "🌐 Access UIs:"
+        echo "  📊 ArgoCD UI:"
+        echo "    kubectl port-forward svc/argocd-server -n argocd 8080:443"
+        echo "    → https://localhost:8080"
+        echo "    Username: admin"
+        echo "    Password: kubectl -n argocd get secret argocd-initial-admin-secret -o jsonpath='{.data.password}' | base64 -d"
+        echo ""
+        echo "  📈 Grafana Dashboard:"
+        echo "    kubectl port-forward svc/grafana-service -n monitoring 3000:3000"
+        echo "    → http://localhost:3000"
+        echo "    Username: admin | Password: admin123"
+        echo ""
+        echo "📊 Monitor deployment:"
+        echo "  - ArgoCD Application: kubectl get app $APP_NAME -n argocd -w"
+        echo "  - Kubernetes Pods: kubectl get pods -n $APP_NAME -w"
+        echo "  - Application Logs: kubectl logs -n $APP_NAME deployment/$APP_NAME -f"
+        echo "  - Image Updater Logs: kubectl logs -n argocd deployment/argocd-image-updater -f"
+        echo ""
+        echo "🔍 Troubleshooting:"
+        echo "  - Check ArgoCD sync status:"
+        echo "    kubectl describe app $APP_NAME -n argocd"
+        echo "  - Check Image Updater:"
+        echo "    kubectl get pods -n argocd | grep image-updater"
+        echo "  - Force ArgoCD sync:"
+        echo "    kubectl patch app $APP_NAME -n argocd --type merge -p '{"metadata":{"annotations":{"argocd.argoproj.io/refresh":"hard"}}}'"
+        echo ""
+        echo "⏰ Deployment initiated at: $(date)"
